@@ -22,8 +22,8 @@ use serde::Deserialize;
 
 const ID_LEN: usize = 6;
 const ID_CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-/// Uploads beyond this many bytes are refused outright rather than truncated.
-const HARD_LIMIT: usize = 16 * 1024 * 1024;
+/// Bytes needed before we can tell whether an upload is an image.
+const SNIFF_LEN: usize = 16;
 
 const INDEX: &str = include_str!("index.txt");
 const WEB_FORM: &str = include_str!("web.html");
@@ -33,7 +33,35 @@ struct Config {
     data_dir: PathBuf,
     base_url: Option<String>,
     max_size: usize,
+    max_image_size: usize,
     trust_proxy: bool,
+}
+
+#[derive(Clone, Copy)]
+enum Kind {
+    Text,
+    Png,
+    Jpeg,
+}
+
+impl Kind {
+    const ALL: [Kind; 3] = [Kind::Text, Kind::Png, Kind::Jpeg];
+
+    fn ext(self) -> &'static str {
+        match self {
+            Kind::Text => "txt",
+            Kind::Png => "png",
+            Kind::Jpeg => "jpg",
+        }
+    }
+
+    fn content_type(self) -> &'static str {
+        match self {
+            Kind::Text => "text/plain; charset=utf-8",
+            Kind::Png => "image/png",
+            Kind::Jpeg => "image/jpeg",
+        }
+    }
 }
 
 struct AppState {
@@ -85,6 +113,7 @@ async fn main() {
             .filter(|s| !s.is_empty())
             .map(|s| s.trim_end_matches('/').to_string()),
         max_size: env_num("PASTE_MAX_SIZE", 128 * 1024),
+        max_image_size: env_num("PASTE_MAX_IMAGE_SIZE", 20 * 1024 * 1024),
         trust_proxy: env::var("PASTE_TRUST_PROXY").is_ok_and(|v| v == "1" || v == "true"),
     };
     let limiter = RateLimiter {
@@ -168,7 +197,8 @@ fn text_response(status: StatusCode, body: impl Into<String>) -> Response {
 async fn index(State(state): State<Shared>, headers: HeaderMap) -> Response {
     let body = INDEX
         .replace("{URL}", &base_url(&state.cfg, &headers))
-        .replace("{MAX_KB}", &(state.cfg.max_size / 1024).to_string());
+        .replace("{MAX_KB}", &(state.cfg.max_size / 1024).to_string())
+        .replace("{MAX_IMAGE_MB}", &(state.cfg.max_image_size / (1024 * 1024)).to_string());
     text_response(StatusCode::OK, body)
 }
 
@@ -189,7 +219,7 @@ impl IntoResponse for PasteError {
         match self {
             PasteError::Binary => text_response(
                 StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                "binary data rejected: only UTF-8 text and markdown are accepted",
+                "unsupported data: only UTF-8 text, markdown, PNG and JPEG are accepted",
             ),
             PasteError::Empty => text_response(StatusCode::BAD_REQUEST, "empty paste"),
             PasteError::TooLarge => text_response(StatusCode::PAYLOAD_TOO_LARGE, "upload too large"),
@@ -216,24 +246,48 @@ async fn create(
         return Err(PasteError::RateLimited);
     }
 
-    // Keep the first max_size bytes; drain (but discard) the rest so the
+    // Once the first bytes say whether this is an image, keep only as much as
+    // that kind may store. Text past its limit is drained (but discarded) so the
     // client gets a clean response, up to a hard ceiling.
+    let hard_limit = cfg.max_image_size.max(cfg.max_size);
     let mut buf = Vec::new();
+    let mut cap: Option<usize> = None;
     let mut total = 0usize;
     let mut stream = body.into_data_stream();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|_| PasteError::Empty)?;
         total += chunk.len();
-        if total > HARD_LIMIT {
+        if total > hard_limit {
             return Err(PasteError::TooLarge);
         }
-        let room = cfg.max_size.saturating_sub(buf.len());
+        let room = cap.unwrap_or(usize::MAX).saturating_sub(buf.len());
         buf.extend_from_slice(&chunk[..room.min(chunk.len())]);
+        if cap.is_none() && buf.len() >= SNIFF_LEN {
+            let limit = match sniff_image(&buf) {
+                Some(_) => cfg.max_image_size,
+                None => cfg.max_size,
+            };
+            buf.truncate(limit);
+            cap = Some(limit);
+        }
     }
-    let truncated = total > cfg.max_size;
 
+    if let Some(kind) = sniff_image(&buf) {
+        // A truncated image is useless, so oversized ones are refused instead.
+        if total > cfg.max_image_size {
+            return Err(PasteError::TooLarge);
+        }
+        if !image_complete(kind, &buf) {
+            return Err(PasteError::Binary);
+        }
+        let id = store(cfg, &buf, kind).await?;
+        let url = format!("{}/{id}.{}", base_url(cfg, &headers), kind.ext());
+        return Ok(text_response(StatusCode::CREATED, url));
+    }
+
+    let truncated = total > cfg.max_size;
     let text = decode_text(buf, truncated)?;
-    let id = store(cfg, &text).await?;
+    let id = store(cfg, text.as_bytes(), Kind::Text).await?;
     let status = if truncated {
         StatusCode::PARTIAL_CONTENT
     } else {
@@ -263,8 +317,28 @@ async fn create_from_form(
         return Err(PasteError::TooLarge);
     }
     let text = decode_text(content.into_bytes(), false)?;
-    let id = store(cfg, &text).await?;
+    let id = store(cfg, text.as_bytes(), Kind::Text).await?;
     Ok(Redirect::to(&format!("/{id}")).into_response())
+}
+
+/// Identifies PNG and JPEG uploads by their magic bytes.
+fn sniff_image(buf: &[u8]) -> Option<Kind> {
+    if buf.starts_with(b"\x89PNG\r\n\x1a\n") && buf.get(12..16) == Some(b"IHDR") {
+        Some(Kind::Png)
+    } else if buf.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some(Kind::Jpeg)
+    } else {
+        None
+    }
+}
+
+/// Cheap sanity check that the whole image arrived. JPEGs often carry trailing
+/// data after the end-of-image marker (e.g. motion photos), so only PNGs are checked.
+fn image_complete(kind: Kind, buf: &[u8]) -> bool {
+    match kind {
+        Kind::Png => buf.ends_with(b"IEND\xaeB`\x82"),
+        _ => true,
+    }
 }
 
 /// Accepts only UTF-8 text; anything that looks binary is rejected.
@@ -298,7 +372,7 @@ fn decode_text(buf: Vec<u8>, truncated: bool) -> Result<String, PasteError> {
     Ok(text)
 }
 
-async fn store(cfg: &Config, text: &str) -> Result<String, PasteError> {
+async fn store(cfg: &Config, data: &[u8], kind: Kind) -> Result<String, PasteError> {
     use tokio::io::AsyncWriteExt;
     loop {
         let id: String = {
@@ -307,7 +381,11 @@ async fn store(cfg: &Config, text: &str) -> Result<String, PasteError> {
                 .map(|_| ID_CHARS[rng.random_range(0..ID_CHARS.len())] as char)
                 .collect()
         };
-        let path = cfg.data_dir.join(format!("{id}.txt"));
+        // Ids are shared across kinds, so `abc123.txt` and `abc123.png` can't coexist.
+        if find_paste(cfg, &id).await.is_some() {
+            continue;
+        }
+        let path = cfg.data_dir.join(format!("{id}.{}", kind.ext()));
         match tokio::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -315,7 +393,7 @@ async fn store(cfg: &Config, text: &str) -> Result<String, PasteError> {
             .await
         {
             Ok(mut file) => {
-                file.write_all(text.as_bytes()).await.map_err(PasteError::Io)?;
+                file.write_all(data).await.map_err(PasteError::Io)?;
                 return Ok(id);
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -335,17 +413,40 @@ fn parse_name(name: &str) -> Option<(&str, Option<&str>)> {
     valid.then_some((id, ext))
 }
 
-async fn read_paste(cfg: &Config, id: &str) -> Option<String> {
-    tokio::fs::read_to_string(cfg.data_dir.join(format!("{id}.txt")))
-        .await
-        .ok()
+async fn find_paste(cfg: &Config, id: &str) -> Option<(Kind, PathBuf)> {
+    for kind in Kind::ALL {
+        let path = cfg.data_dir.join(format!("{id}.{}", kind.ext()));
+        if tokio::fs::try_exists(&path).await.unwrap_or(false) {
+            return Some((kind, path));
+        }
+    }
+    None
 }
 
 async fn fetch(State(state): State<Shared>, Path(name): Path<String>) -> Response {
     let Some((id, ext)) = parse_name(&name) else {
         return text_response(StatusCode::NOT_FOUND, "not found");
     };
-    let Some(text) = read_paste(&state.cfg, id).await else {
+    let Some((kind, path)) = find_paste(&state.cfg, id).await else {
+        return text_response(StatusCode::NOT_FOUND, "not found");
+    };
+
+    // Images are served as themselves whatever extension was asked for.
+    if !matches!(kind, Kind::Text) {
+        let Ok(data) = tokio::fs::read(&path).await else {
+            return text_response(StatusCode::NOT_FOUND, "not found");
+        };
+        return (
+            [
+                (header::CONTENT_TYPE, kind.content_type()),
+                (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+                (header::CONTENT_SECURITY_POLICY, "default-src 'none'"),
+            ],
+            data,
+        )
+            .into_response();
+    }
+    let Ok(text) = tokio::fs::read_to_string(&path).await else {
         return text_response(StatusCode::NOT_FOUND, "not found");
     };
 
@@ -399,7 +500,10 @@ async fn remove(State(state): State<Shared>, Path(name): Path<String>) -> Respon
     let Some((id, _)) = parse_name(&name) else {
         return text_response(StatusCode::NOT_FOUND, "not found");
     };
-    match tokio::fs::remove_file(state.cfg.data_dir.join(format!("{id}.txt"))).await {
+    let Some((_, path)) = find_paste(&state.cfg, id).await else {
+        return text_response(StatusCode::NOT_FOUND, "not found");
+    };
+    match tokio::fs::remove_file(path).await {
         Ok(()) => text_response(StatusCode::OK, "paste deleted"),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             text_response(StatusCode::NOT_FOUND, "not found")

@@ -1,9 +1,9 @@
 
   ABOUT
 
-      A simple pastebin for text and markdown.
+      A simple pastebin for text, markdown and images.
 
-      Simple API. CLI. Web form. Renders Markdown.
+      Simple API. CLI. Web form. Renders Markdown. Hosts PNGs and JPEGs.
 
       Web Form: {URL}/web
 
@@ -13,19 +13,22 @@
 
           Send the raw data along. Will respond with a link to the paste.
 
-          Only UTF-8 text is accepted; binary data is rejected with 415
-          (UNSUPPORTED MEDIA TYPE). The maximum paste size is {MAX_KB}KiB.
+          UTF-8 text (up to {MAX_KB}KiB) and PNG or JPEG images (up to
+          {MAX_IMAGE_MB}MiB) are accepted; the type is detected from the data.
+          Anything else is rejected with 415 (UNSUPPORTED MEDIA TYPE).
 
           If the response code is 201 (CREATED), then the entire paste was
-          uploaded. If the response is 206 (PARTIAL), then the paste exceeded
-          the server's maximum upload size, and only part of the paste was
-          uploaded. If the response code is anything else, an error has
-          occurred. Pasting is rate limited.
+          uploaded. If the response is 206 (PARTIAL), then the text paste
+          exceeded the server's maximum upload size, and only part of it was
+          uploaded. Images are never truncated: an oversized image gets 413
+          (PAYLOAD TOO LARGE). If the response code is anything else, an error
+          has occurred. Pasting is rate limited.
 
       GET {URL}/<id>
       GET {URL}/<id>.txt
 
-          Retrieve the paste with the given id as plain-text.
+          Retrieve the paste with the given id as plain-text, or the image
+          if the paste is an image (any extension works for images).
 
       GET {URL}/<id>.md
 
@@ -42,6 +45,10 @@
       Paste a file named 'file.txt' using cURL:
 
           curl --data-binary @file.txt {URL}/
+
+      Upload a screenshot using cURL:
+
+          curl --data-binary @screenshot.png {URL}/
 
       Paste from stdin using cURL:
 
