@@ -10,6 +10,11 @@ from the uploaded bytes. `GET /<id>` and `/<id>.txt` return raw text, `/<id>.md`
 and image pastes are served as images at any extension. Other binary uploads get 415. Text over
 the size limit is truncated (206); images over theirs are refused (413).
 
+In a browser, `/` is an HTML version of the help page: press ⌘V / Ctrl+V anywhere (text or an image)
+or drop a file on it to upload it. `/web` has a text form plus an image picker, and also takes
+pasted or dropped images. These uploads show a progress bar and then open the new paste. They go
+through `POST /` like the API does, so the same limits and rate limit apply.
+
 ## Configuration (env vars)
 
 | var | default | |
@@ -42,8 +47,12 @@ files except [`.env.example`](.env.example) are git-ignored.
 Every request becomes a span (`POST / → 201`) with the method, path, status, client IP
 (`client.address`, honouring `PASTE_TRUST_PROXY`), peer IP, user agent, referer and body size.
 Inside it are events for paste created (id, kind, bytes, truncated, client IP), viewed, not found,
-deleted (warn), rejected (reason) and rate limited (warn); I/O errors are logged as errors and mark
-the span as failed. Example query:
+deleted (warn), rejected (reason: `unsupported`, `empty`, `too_large`, `aborted`) and rate limited (warn); I/O errors are logged as errors and mark
+the span as failed. `paste.via` (on the created event and the request span) says where a paste came
+from: `api`, `web` (the text form), or `<page>-<action>` for browser uploads, e.g. `home-paste` or
+`web-upload`. The browser sends that tag in `X-Paste-Client`. Only known values are recorded, and
+anything else is logged as `api`. Paste contents, filenames and clipboard data are never logged, and
+the browser sends nothing to Logfire directly. Example query:
 
 ```sql
 SELECT start_timestamp, attributes->>'client.address' AS ip, attributes->>'paste.id' AS id,

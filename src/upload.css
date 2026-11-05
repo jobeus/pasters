@@ -1,0 +1,13 @@
+  #upload { position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%); width: min(420px, calc(100% - 32px));
+            padding: 12px 14px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg);
+            box-shadow: 0 6px 24px rgba(0,0,0,.18); font: 13px/1.4 system-ui, sans-serif; z-index: 10; }
+  #upload .bar { height: 6px; border-radius: 3px; background: var(--border); overflow: hidden; }
+  #upload .fill { height: 100%; width: 0; background: var(--accent); transition: width .15s linear; }
+  #upload .label { margin-top: 8px; color: var(--muted); overflow-wrap: anywhere; }
+  #upload[data-state="error"] { cursor: pointer; }
+  #upload[data-state="error"] .fill { background: #d93025; }
+  #upload[data-state="error"] .label { color: #d93025; }
+  #upload[data-state="error"] .label::after { content: " (click to dismiss)"; color: var(--muted); }
+  body.dragging::after { content: "Drop to upload"; position: fixed; inset: 8px; display: flex; align-items: center; justify-content: center;
+                         border: 2px dashed var(--accent); border-radius: 12px; background: color-mix(in srgb, var(--bg) 85%, transparent);
+                         color: var(--accent); font: 600 20px system-ui, sans-serif; pointer-events: none; z-index: 9; }

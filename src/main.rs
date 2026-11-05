@@ -33,7 +33,23 @@ const ID_CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ01
 const SNIFF_LEN: usize = 16;
 
 const INDEX: &str = include_str!("index.txt");
+const INDEX_PAGE: &str = include_str!("index.html");
 const WEB_FORM: &str = include_str!("web.html");
+const UPLOAD_SCRIPT: &str = include_str!("upload.js");
+const UPLOAD_STYLE: &str = include_str!("upload.css");
+/// CSP for our own HTML pages: inline script and style only, XHR back to us, nothing else.
+const PAGE_CSP: &str = "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; \
+     connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'";
+/// `X-Paste-Client` values sent by the upload script (`<page>-<action>`). Only these are logged
+/// as `paste.via`, so a client can't put arbitrary strings into the logs.
+const WEB_CLIENTS: [&str; 6] = [
+    "home-paste",
+    "home-drop",
+    "home-upload",
+    "web-paste",
+    "web-drop",
+    "web-upload",
+];
 const MD_PAGE: &str = include_str!("md.html");
 
 struct Config {
@@ -347,6 +363,7 @@ async fn observe(State(state): State<Shared>, mut req: Request, next: Next) -> R
         user_agent.original = user_agent,
         http.request.header.referer = referer,
         http.request.body.size = body_size,
+        paste.via = field::Empty,
         http.response.status_code = field::Empty,
         otel.status_code = field::Empty,
     );
@@ -418,22 +435,77 @@ fn text_response(status: StatusCode, body: impl Into<String>) -> Response {
         .into_response()
 }
 
-async fn index(State(state): State<Shared>, headers: HeaderMap) -> Response {
-    let body = INDEX
-        .replace("{URL}", &base_url(&state.cfg, &headers))
-        .replace("{MAX_KB}", &(state.cfg.max_size / 1024).to_string())
+fn fill_limits(template: &str, cfg: &Config) -> String {
+    template
+        .replace("{MAX_KB}", &(cfg.max_size / 1024).to_string())
         .replace(
             "{MAX_IMAGE_MB}",
-            &(state.cfg.max_image_size / (1024 * 1024)).to_string(),
-        );
-    text_response(StatusCode::OK, body)
+            &(cfg.max_image_size / (1024 * 1024)).to_string(),
+        )
+        .replace("{MAX_TEXT}", &cfg.max_size.to_string())
+        .replace("{MAX_IMAGE}", &cfg.max_image_size.to_string())
 }
 
-async fn web_form(State(state): State<Shared>) -> Html<String> {
-    Html(WEB_FORM.replace("{MAX_KB}", &(state.cfg.max_size / 1024).to_string()))
+/// An HTML page with the upload script, served with [`PAGE_CSP`].
+fn page_response(template: &str, cfg: &Config, extra: &[(&str, &str)]) -> Response {
+    let mut page = fill_limits(template, cfg);
+    for (key, value) in extra {
+        page = page.replace(key, value);
+    }
+    // Last, so nothing inside the script or stylesheet is mistaken for a placeholder.
+    let page = page
+        .replace("{UPLOAD_STYLE}", UPLOAD_STYLE)
+        .replace("{UPLOAD_SCRIPT}", UPLOAD_SCRIPT);
+    let mut resp = Html(page).into_response();
+    resp.headers_mut().insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(PAGE_CSP),
+    );
+    resp
+}
+
+fn escape_html(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Plain text for curl and friends; browsers get the same text in an HTML page that also
+/// accepts pasted and dropped content.
+async fn index(State(state): State<Shared>, headers: HeaderMap) -> Response {
+    let url = base_url(&state.cfg, &headers);
+    let text = fill_limits(INDEX, &state.cfg).replace("{URL}", &url);
+    let wants_html = headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.contains("text/html"));
+    let mut resp = if wants_html {
+        let web = escape_html(&format!("{url}/web"));
+        let body = escape_html(&text).replacen(&web, &format!("<a href=\"/web\">{web}</a>"), 1);
+        page_response(INDEX_PAGE, &state.cfg, &[("{INDEX}", &body)])
+    } else {
+        text_response(StatusCode::OK, text)
+    };
+    resp.headers_mut()
+        .insert(header::VARY, HeaderValue::from_static("Accept"));
+    resp
+}
+
+async fn web_form(State(state): State<Shared>) -> Response {
+    page_response(WEB_FORM, &state.cfg, &[])
 }
 
 enum PasteError {
+    /// The client went away mid-upload, after sending this many bytes.
+    Aborted(usize),
     Binary,
     Empty,
     TooLarge,
@@ -445,12 +517,18 @@ impl IntoResponse for PasteError {
     fn into_response(self) -> Response {
         match &self {
             PasteError::RateLimited => tracing::warn!("paste rejected: rate limited"),
+            PasteError::Aborted(received) => tracing::info!(
+                reason = "aborted",
+                paste.bytes_received = *received as u64,
+                "paste rejected"
+            ),
             PasteError::Io(e) => tracing::error!(error = %e, "io error"),
             PasteError::Binary => tracing::info!(reason = "unsupported", "paste rejected"),
             PasteError::Empty => tracing::info!(reason = "empty", "paste rejected"),
             PasteError::TooLarge => tracing::info!(reason = "too_large", "paste rejected"),
         }
         match self {
+            PasteError::Aborted(_) => text_response(StatusCode::BAD_REQUEST, "upload aborted"),
             PasteError::Binary => text_response(
                 StatusCode::UNSUPPORTED_MEDIA_TYPE,
                 "unsupported data: only UTF-8 text, markdown, PNG and JPEG are accepted",
@@ -489,6 +567,12 @@ async fn create(
     body: Body,
 ) -> Result<Response, PasteError> {
     let cfg = &state.cfg;
+    let via = headers
+        .get("x-paste-client")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| WEB_CLIENTS.iter().find(|c| **c == v).copied())
+        .unwrap_or("api");
+    tracing::Span::current().record("paste.via", via);
     if !state.limiter.allow(ip) {
         return Err(PasteError::RateLimited);
     }
@@ -502,7 +586,7 @@ async fn create(
     let mut total = 0usize;
     let mut stream = body.into_data_stream();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|_| PasteError::Empty)?;
+        let chunk = chunk.map_err(|_| PasteError::Aborted(total))?;
         total += chunk.len();
         if total > hard_limit {
             return Err(PasteError::TooLarge);
@@ -528,7 +612,7 @@ async fn create(
             return Err(PasteError::Binary);
         }
         let id = store(cfg, &buf, kind).await?;
-        log_created(&id, kind, buf.len(), false, ip, "api");
+        log_created(&id, kind, buf.len(), false, ip, via);
         let url = format!("{}/{id}.{}", base_url(cfg, &headers), kind.ext());
         return Ok(text_response(StatusCode::CREATED, url));
     }
@@ -536,7 +620,7 @@ async fn create(
     let truncated = total > cfg.max_size;
     let text = decode_text(buf, truncated)?;
     let id = store(cfg, text.as_bytes(), Kind::Text).await?;
-    log_created(&id, Kind::Text, text.len(), truncated, ip, "api");
+    log_created(&id, Kind::Text, text.len(), truncated, ip, via);
     let status = if truncated {
         StatusCode::PARTIAL_CONTENT
     } else {
@@ -559,6 +643,7 @@ async fn create_from_form(
     Form(form): Form<WebPaste>,
 ) -> Result<Response, PasteError> {
     let cfg = &state.cfg;
+    tracing::Span::current().record("paste.via", "web");
     if !state.limiter.allow(ip) {
         return Err(PasteError::RateLimited);
     }
@@ -1020,6 +1105,63 @@ mod tests {
             !body.contains("{URL}") && !body.contains("{MAX_KB}"),
             "{body}"
         );
+    }
+
+    #[tokio::test]
+    async fn browsers_get_an_html_homepage_with_the_upload_script() {
+        let t = test_app(|_, _| {});
+        let req = HttpRequest::get("/")
+            .header(header::ACCEPT, "text/html,application/xhtml+xml,*/*;q=0.8")
+            .body(Body::empty())
+            .unwrap();
+        let (status, headers, body) = t.send(req).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            headers[header::CONTENT_TYPE]
+                .to_str()
+                .unwrap()
+                .starts_with("text/html")
+        );
+        assert_eq!(headers[header::VARY], "Accept");
+        let csp = headers[header::CONTENT_SECURITY_POLICY].to_str().unwrap();
+        assert!(csp.contains("connect-src 'self'"), "{csp}");
+        let body = String::from_utf8(body).unwrap();
+        assert!(body.contains(r#"data-page="home""#), "{body}");
+        assert!(body.contains(r#"data-max-text="64""#), "{body}");
+        assert!(body.contains(r#"data-max-image="256""#), "{body}");
+        assert!(body.contains("X-Paste-Client"), "script missing");
+        // The index text is escaped, and the web form URL is a link.
+        assert!(body.contains("GET https://paste.test/&lt;id&gt;"), "{body}");
+        assert!(body.contains(r#"<a href="/web">https://paste.test/web</a>"#));
+        assert!(
+            !body.contains("{UPLOAD_") && !body.contains("{MAX_"),
+            "{body}"
+        );
+
+        let (_, headers, body) = t.get("/web").await;
+        let body = String::from_utf8(body).unwrap();
+        assert!(headers.contains_key(header::CONTENT_SECURITY_POLICY));
+        assert!(body.contains(r#"data-page="web""#) && body.contains(r#"id="file""#));
+        assert!(
+            !body.contains("{UPLOAD_") && !body.contains("{MAX_"),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn uploads_from_the_page_script_work_like_api_uploads() {
+        let t = test_app(|_, _| {});
+        // Known and unknown client tags are both accepted; only the tag in the logs differs.
+        for client in ["home-paste", "web-upload", "<script>"] {
+            let req = HttpRequest::post("/")
+                .header("x-paste-client", client)
+                .header(header::CONTENT_TYPE, "image/png")
+                .body(Body::from(png(100)))
+                .unwrap();
+            let (status, _, body) = t.send(req).await;
+            assert_eq!(status, StatusCode::CREATED, "{client}");
+            assert!(String::from_utf8(body).unwrap().trim().ends_with(".png"));
+        }
     }
 
     #[tokio::test]

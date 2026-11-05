@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>paste</title>
+<style>
+  :root { color-scheme: light dark; --bg: #fafafa; --fg: #1d1d1f; --muted: #6e6e73; --border: #d2d2d7; --accent: #0a66d8; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #161618; --fg: #e8e8ed; --muted: #8e8e93; --border: #3a3a3c; --accent: #4c9bff; } }
+  body { margin: 0; background: var(--bg); color: var(--fg); }
+  main { max-width: 960px; margin: 0 auto; padding: 24px 16px 96px; }
+  .hint { margin: 0 0 8px; padding: 10px 14px; border: 1px dashed var(--border); border-radius: 6px; color: var(--muted);
+          font: 14px/1.5 system-ui, sans-serif; }
+  kbd { font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; padding: 1px 5px; border: 1px solid var(--border); border-radius: 4px; }
+  pre { margin: 0; font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; overflow-x: auto; }
+  a { color: var(--accent); }
+{UPLOAD_STYLE}
+</style>
+</head>
+<body data-page="home" data-max-text="{MAX_TEXT}" data-max-image="{MAX_IMAGE}">
+<main>
+<p class="hint">Press <kbd>⌘V</kbd> / <kbd>Ctrl+V</kbd> anywhere on this page to paste text or an image, or drop a file here.</p>
+<pre>{INDEX}</pre>
+</main>
+<script>
+{UPLOAD_SCRIPT}
+</script>
+</body>
+</html>
