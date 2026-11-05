@@ -37,8 +37,9 @@ const INDEX_PAGE: &str = include_str!("index.html");
 const WEB_FORM: &str = include_str!("web.html");
 const UPLOAD_SCRIPT: &str = include_str!("upload.js");
 const UPLOAD_STYLE: &str = include_str!("upload.css");
+const FAVICON: &str = include_str!("favicon.svg");
 /// CSP for our own HTML pages: inline script and style only, XHR back to us, nothing else.
-const PAGE_CSP: &str = "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; \
+const PAGE_CSP: &str = "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self'; \
      connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'";
 /// `X-Paste-Client` values sent by the upload script (`<page>-<action>`). Only these are logged
 /// as `paste.via`, so a client can't put arbitrary strings into the logs.
@@ -303,6 +304,8 @@ fn app(state: Shared) -> Router {
     Router::new()
         .route("/", get(index).post(create))
         .route("/web", get(web_form).post(create_from_form))
+        .route("/favicon.svg", get(favicon))
+        .route("/favicon.ico", get(favicon))
         .route("/{name}", get(fetch).delete(remove))
         .layer(DefaultBodyLimit::max(4 * 1024 * 1024))
         .layer(middleware::from_fn_with_state(state.clone(), observe))
@@ -502,6 +505,21 @@ async fn index(State(state): State<Shared>, headers: HeaderMap) -> Response {
     resp.headers_mut()
         .insert(header::VARY, HeaderValue::from_static("Accept"));
     resp
+}
+
+/// A clipboard icon. Also answers `/favicon.ico`, which browsers request unprompted;
+/// modern ones render the SVG fine.
+async fn favicon() -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, "image/svg+xml"),
+            (header::CACHE_CONTROL, "public, max-age=86400"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            (header::CONTENT_SECURITY_POLICY, "default-src 'none'"),
+        ],
+        FAVICON,
+    )
+        .into_response()
 }
 
 async fn web_form(State(state): State<Shared>) -> Response {
@@ -1135,6 +1153,17 @@ mod tests {
         assert_eq!(t.delete(path).await, StatusCode::OK);
         assert_eq!(t.get(path).await.0, StatusCode::NOT_FOUND);
         assert_eq!(t.delete(path).await, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn favicon_is_served() {
+        let t = test_app(|_, _| {});
+        for path in ["/favicon.svg", "/favicon.ico"] {
+            let (status, headers, body) = t.get(path).await;
+            assert_eq!(status, StatusCode::OK, "{path}");
+            assert_eq!(headers[header::CONTENT_TYPE], "image/svg+xml");
+            assert!(body.starts_with(b"<svg"), "{path}");
+        }
     }
 
     #[tokio::test]
