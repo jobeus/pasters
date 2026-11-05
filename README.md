@@ -57,6 +57,50 @@ FROM records WHERE message LIKE 'paste created%' ORDER BY start_timestamp DESC
     cargo fmt --check && cargo clippy --all-targets -- -D warnings
 
 CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs these on pushes and PRs to `main`.
-After a green run on `main`, its `deploy` job POSTs `{"sha","ref"}` to `DEPLOY_WEBHOOK_URL`, signed
-with HMAC-SHA256 of `<timestamp>.<body>` using `DEPLOY_WEBHOOK_SECRET` (headers `X-Deploy-Timestamp`,
-`X-Deploy-Signature: sha256=…`). It is skipped until both repository secrets are set.
+
+## Deploying (auto-update on push)
+
+After a green CI run on `main`, the `deploy` job POSTs to the server's deploy webhook, the same
+protocol as cmwgpt:
+
+```
+POST /deploy
+X-Deploy-Timestamp: <unix seconds>
+X-Deploy-Signature: sha256=<hex HMAC-SHA256 of "<timestamp>.<body>">
+{"sha": "<commit>", "ref": "refs/heads/main"}
+```
+
+pasters ([`src/deploy.rs`](src/deploy.rs)) rejects bad signatures or timestamps more than 5 minutes
+off (401) and answers `up-to-date` if it is already on that sha. Otherwise it answers 202, then in
+the background runs `git pull --ff-only` and `cargo build --release --locked`, and only then exits
+with code `42`; [`start.sh`](start.sh) relaunches the new binary. The site keeps serving during the
+build, so downtime is just the restart. A failed pull or build is logged (Logfire, journal) and the
+old binary keeps running. Webhooks that arrive mid-build are coalesced into one more pull afterwards.
+
+| var | default | |
+|---|---|---|
+| `DEPLOY_WEBHOOK_SECRET` | unset | shared HMAC secret; the listener is off when empty |
+| `DEPLOY_WEBHOOK_HOST` | `127.0.0.1` | listener interface (Apache proxies to it) |
+| `DEPLOY_WEBHOOK_PORT` | `8787` | listener port |
+| `DEPLOY_BUILD_COMMAND` | `cargo build --release --locked` | run after the pull, in the checkout |
+
+### Server setup (grizzly)
+
+1. In the checkout (e.g. `~/pasters`), put in `.env.production`: `DEPLOY_WEBHOOK_SECRET=<openssl rand -hex 32>`,
+   `PASTE_TRUST_PROXY=1` (so real client IPs reach the logs, not Apache's 127.0.0.1) and `LOGFIRE_API_KEY`.
+2. Run pasters under systemd via [`deploy/pasters.service`](deploy/pasters.service) (install steps are
+   in the file). It runs `start.sh`; stop any other copy on port 8000 first.
+3. Use [`deploy/apache-paste.jobe.wtf.conf`](deploy/apache-paste.jobe.wtf.conf) as the vhost: it adds
+   `ProxyPass /__deploy` → `127.0.0.1:8787/deploy` ahead of the main proxy, so no extra port is opened.
+   Then `sudo apachectl configtest && sudo systemctl reload apache2`.
+4. GitHub → Settings → Secrets and variables → Actions: `DEPLOY_WEBHOOK_URL=https://paste.jobe.wtf/__deploy`
+   and `DEPLOY_WEBHOOK_SECRET` (same value as on the server).
+
+The checkout must be able to `git pull` non-interactively (deploy key or public HTTPS remote).
+Without both Actions secrets the deploy job skips itself. Test by hand:
+
+```bash
+body='{"sha":"manual","ref":"refs/heads/main"}'; ts=$(date +%s)
+sig=$(printf '%s.%s' "$ts" "$body" | openssl dgst -sha256 -hmac "$DEPLOY_WEBHOOK_SECRET" -r | cut -d' ' -f1)
+curl -X POST https://paste.jobe.wtf/__deploy -H "X-Deploy-Timestamp: $ts" -H "X-Deploy-Signature: sha256=$sig" --data "$body"
+```

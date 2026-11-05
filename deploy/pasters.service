@@ -1,0 +1,28 @@
+# systemd unit for pasters. Install on the host with:
+#   sudo cp deploy/pasters.service /etc/systemd/system/
+#   sudo sed -i 's|/path/to/pasters|'"$PWD"'|g; s|^User=.*|User='"$USER"'|; s|/home/CHANGE_ME|'"$HOME"'|' /etc/systemd/system/pasters.service
+#   sudo systemctl daemon-reload && sudo systemctl enable --now pasters
+# Logs: journalctl -u pasters -f (and Logfire)
+
+[Unit]
+Description=pasters pastebin
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=CHANGE_ME
+WorkingDirectory=/path/to/pasters
+# start.sh relaunches on exit 42 (deploy webhook); systemd covers crashes and reboots.
+ExecStart=/path/to/pasters/start.sh
+Restart=always
+RestartSec=5
+# pasters drains in-flight requests and flushes Logfire on SIGTERM.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+# cargo/rustup live in ~/.cargo/bin; start.sh and the deploy webhook both run cargo.
+Environment=PATH=/home/CHANGE_ME/.cargo/bin:/usr/local/bin:/usr/bin:/bin
+# Release builds default to PASTE_ENV=production, so .env.production (then .env) is loaded.
+
+[Install]
+WantedBy=multi-user.target
