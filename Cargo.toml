@@ -5,8 +5,15 @@ edition = "2024"
 
 [dependencies]
 axum = "0.8.9"
+dotenvy = "0.15.7"
 futures-util = "0.3.34"
+logfire = "0.13.1"
 pulldown-cmark = { version = "0.13.6", default-features = false, features = ["html"] }
 rand = "0.10.3"
 serde = { version = "1.0.229", features = ["derive"] }
 tokio = { version = "1.54.1", features = ["full"] }
+tracing = "0.1.44"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+tower = { version = "0.5", features = ["util"] }
