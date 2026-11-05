@@ -478,16 +478,21 @@ fn escape_html(s: &str) -> String {
     out
 }
 
+/// Browsers ask for `text/html` explicitly; curl, wget and most HTTP libraries send `*/*`
+/// or nothing at all.
+fn wants_html(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.contains("text/html"))
+}
+
 /// Plain text for curl and friends; browsers get the same text in an HTML page that also
 /// accepts pasted and dropped content.
 async fn index(State(state): State<Shared>, headers: HeaderMap) -> Response {
     let url = base_url(&state.cfg, &headers);
     let text = fill_limits(INDEX, &state.cfg).replace("{URL}", &url);
-    let wants_html = headers
-        .get(header::ACCEPT)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.contains("text/html"));
-    let mut resp = if wants_html {
+    let mut resp = if wants_html(&headers) {
         let web = escape_html(&format!("{url}/web"));
         let body = escape_html(&text).replacen(&web, &format!("<a href=\"/web\">{web}</a>"), 1);
         page_response(INDEX_PAGE, &state.cfg, &[("{INDEX}", &body)])
@@ -760,7 +765,11 @@ async fn find_paste(cfg: &Config, id: &str) -> Option<(Kind, PathBuf)> {
     None
 }
 
-async fn fetch(State(state): State<Shared>, Path(name): Path<String>) -> Response {
+async fn fetch(
+    State(state): State<Shared>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+) -> Response {
     let Some((id, ext)) = parse_name(&name) else {
         return text_response(StatusCode::NOT_FOUND, "not found");
     };
@@ -794,8 +803,12 @@ async fn fetch(State(state): State<Shared>, Path(name): Path<String>) -> Respons
         return text_response(StatusCode::NOT_FOUND, "not found");
     };
 
-    match ext.map(str::to_ascii_lowercase).as_deref() {
-        Some("md" | "mdown" | "markdown") => {
+    let is_md = matches!(
+        ext.map(str::to_ascii_lowercase).as_deref(),
+        Some("md" | "mdown" | "markdown")
+    );
+    let mut resp = match (is_md, wants_html(&headers)) {
+        (true, true) => {
             let page = MD_PAGE
                 .replace("{TITLE}", id)
                 .replace("{BODY}", &render_markdown(&text));
@@ -810,16 +823,27 @@ async fn fetch(State(state): State<Shared>, Path(name): Path<String>) -> Respons
             );
             resp
         }
-        _ => {
-            let mut resp =
-                ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], text).into_response();
+        // curl, wget etc. get the markdown source byte for byte.
+        (is_md, _) => {
+            let content_type = if is_md {
+                "text/markdown; charset=utf-8"
+            } else {
+                "text/plain; charset=utf-8"
+            };
+            let mut resp = ([(header::CONTENT_TYPE, content_type)], text).into_response();
             resp.headers_mut().insert(
                 header::X_CONTENT_TYPE_OPTIONS,
                 HeaderValue::from_static("nosniff"),
             );
             resp
         }
+    };
+    if is_md {
+        // Caches must keep the HTML and raw variants apart.
+        resp.headers_mut()
+            .insert(header::VARY, HeaderValue::from_static("Accept"));
     }
+    resp
 }
 
 fn render_markdown(src: &str) -> String {
@@ -973,14 +997,41 @@ mod tests {
     async fn markdown_is_rendered_with_html_escaped() {
         let t = test_app(|_, _| {});
         let (_, url) = t.post("# Title\n\n<script>alert(1)</script>").await;
-        let (status, headers, body) = t.get(&format!("{}.md", path_of(&url))).await;
+        let req = HttpRequest::get(format!("{}.md", path_of(&url)))
+            .header(header::ACCEPT, "text/html,application/xhtml+xml,*/*;q=0.8")
+            .body(Body::empty())
+            .unwrap();
+        let (status, headers, body) = t.send(req).await;
         assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers[header::VARY], "Accept");
         let body = String::from_utf8(body).unwrap();
         assert!(body.contains("<h1>Title</h1>"), "{body}");
         assert!(!body.contains("<script>alert"), "{body}");
         assert!(body.contains("&lt;script&gt;"), "{body}");
         let csp = headers[header::CONTENT_SECURITY_POLICY].to_str().unwrap();
         assert!(csp.starts_with("default-src 'none'"));
+    }
+
+    #[tokio::test]
+    async fn markdown_is_raw_for_curl_and_wget() {
+        let t = test_app(|_, _| {});
+        let src = "# Title\n\n<b>hi</b>\n";
+        let (_, url) = t.post(src).await;
+        let path = format!("{}.md", path_of(&url));
+        for accept in [None, Some("*/*")] {
+            let mut req = HttpRequest::get(&path);
+            if let Some(a) = accept {
+                req = req.header(header::ACCEPT, a);
+            }
+            let (status, headers, body) = t.send(req.body(Body::empty()).unwrap()).await;
+            assert_eq!(status, StatusCode::OK, "{accept:?}");
+            assert_eq!(
+                headers[header::CONTENT_TYPE],
+                "text/markdown; charset=utf-8"
+            );
+            assert_eq!(headers[header::VARY], "Accept");
+            assert_eq!(body, src.as_bytes(), "{accept:?}");
+        }
     }
 
     #[tokio::test]

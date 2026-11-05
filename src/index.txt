@@ -33,8 +33,10 @@
       GET {URL}/<id>.md
 
           Retrieve the paste with the given id rendered as markdown into
-          HTML. "mdown" and "markdown" work too. Any other extension
-          returns the paste as plain-text.
+          HTML when requested by a browser (Accept: text/html), or as
+          the raw markdown source otherwise (curl, wget, ...).
+          "mdown" and "markdown" work too. Any other extension returns
+          the paste as plain-text.
 
       DELETE {URL}/<id>
 

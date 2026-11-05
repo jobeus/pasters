@@ -6,7 +6,8 @@ A tiny paste.rs-style pastebin for text, markdown, PNGs and JPEGs.
     ./target/release/pasters
 
 Pastes are stored as `<id>.txt`, `<id>.png` or `<id>.jpg` in the data dir; the type is detected
-from the uploaded bytes. `GET /<id>` and `/<id>.txt` return raw text, `/<id>.md` renders markdown,
+from the uploaded bytes. `GET /<id>` and `/<id>.txt` return raw text, `/<id>.md` renders markdown for browsers
+(`Accept: text/html`) and returns the raw source to curl/wget,
 and image pastes are served as images at any extension. Other binary uploads get 415. Text over
 the size limit is truncated (206); images over theirs are refused (413).
 
