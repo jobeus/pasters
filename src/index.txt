@@ -1,0 +1,62 @@
+
+  ABOUT
+
+      A simple pastebin for text and markdown.
+
+      Simple API. CLI. Web form. Renders Markdown.
+
+      Web Form: {URL}/web
+
+  API USAGE
+
+      POST {URL}/
+
+          Send the raw data along. Will respond with a link to the paste.
+
+          Only UTF-8 text is accepted; binary data is rejected with 415
+          (UNSUPPORTED MEDIA TYPE). The maximum paste size is {MAX_KB}KiB.
+
+          If the response code is 201 (CREATED), then the entire paste was
+          uploaded. If the response is 206 (PARTIAL), then the paste exceeded
+          the server's maximum upload size, and only part of the paste was
+          uploaded. If the response code is anything else, an error has
+          occurred. Pasting is rate limited.
+
+      GET {URL}/<id>
+      GET {URL}/<id>.txt
+
+          Retrieve the paste with the given id as plain-text.
+
+      GET {URL}/<id>.md
+
+          Retrieve the paste with the given id rendered as markdown into
+          HTML. "mdown" and "markdown" work too. Any other extension
+          returns the paste as plain-text.
+
+      DELETE {URL}/<id>
+
+          Delete the paste with the given id.
+
+  EXAMPLES
+
+      Paste a file named 'file.txt' using cURL:
+
+          curl --data-binary @file.txt {URL}/
+
+      Paste from stdin using cURL:
+
+          echo "Hello, world." | curl --data-binary @- {URL}/
+
+      Delete an existing paste with id <id> using cURL:
+
+          curl -X DELETE {URL}/<id>
+
+      A shell function that can be added to `.bashrc` or `.bash_profile` for
+      quick pasting from the command line. The command takes a filename or reads
+      from stdin if none was supplied and outputs the URL of the paste to
+      stdout: `paste file.txt` or `echo "hi" | paste`.
+
+          function paste() {
+              local file=${1:-/dev/stdin}
+              curl --data-binary @${file} {URL}/
+          }

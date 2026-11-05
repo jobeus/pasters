@@ -1,0 +1,12 @@
+[package]
+name = "pasters"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+axum = "0.8.9"
+futures-util = "0.3.34"
+pulldown-cmark = { version = "0.13.6", default-features = false, features = ["html"] }
+rand = "0.10.3"
+serde = { version = "1.0.229", features = ["derive"] }
+tokio = { version = "1.54.1", features = ["full"] }
