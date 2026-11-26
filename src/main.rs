@@ -184,7 +184,7 @@ async fn main() {
         || env::var("LOGFIRE_TOKEN").is_ok();
 
     let addr: SocketAddr = env::var("PASTE_ADDR")
-        .unwrap_or_else(|_| "0.0.0.0:8000".into())
+        .unwrap_or_else(|_| "127.0.0.1:8000".into())
         .parse()
         .expect("PASTE_ADDR must be host:port");
     let cfg = Config {
@@ -278,7 +278,7 @@ async fn spawn_deploy_listener(
             build_command: env::var("DEPLOY_BUILD_COMMAND")
                 .ok()
                 .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| "cargo build --release --locked".into()),
+                .unwrap_or_else(|| "scripts/release-build.sh".into()),
         },
         stop_tx,
     );
