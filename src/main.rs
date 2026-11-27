@@ -20,12 +20,7 @@ use futures_util::StreamExt;
 use pulldown_cmark::{Event, Options, Parser, html};
 use rand::RngExt;
 use serde::Deserialize;
-use tokio::sync::watch;
 use tracing::{Instrument, field};
-
-use deploy::Stop;
-
-mod deploy;
 
 const ID_LEN: usize = 6;
 const ID_CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
@@ -209,95 +204,54 @@ async fn main() {
 
     let app = app(Arc::new(AppState { cfg, limiter }));
 
-    let (stop_tx, stop_rx) = watch::channel(Stop::Running);
-    {
-        let stop_tx = stop_tx.clone();
-        tokio::spawn(async move {
-            shutdown_signal().await;
-            stop_tx.send_replace(Stop::Signal);
-        });
+    // On grizzly the unit sets APP_SOCKET and Apache proxies to that socket; anywhere else
+    // (or with PASTE_ADDR set) it's a TCP port.
+    let socket = env::var("APP_SOCKET")
+        .ok()
+        .filter(|s| !s.is_empty() && env::var("PASTE_ADDR").is_err());
+    if let Some(path) = socket {
+        // A socket left behind by a process that was killed would make bind fail.
+        let _ = std::fs::remove_file(&path);
+        let listener = tokio::net::UnixListener::bind(&path).expect("failed to bind APP_SOCKET");
+        tracing::info!(
+            socket = %path,
+            env = %mode,
+            env_files = ?env_files,
+            logfire = logfire_enabled,
+            "listening on unix:{path}"
+        );
+        // No peer address on a unix socket: handlers see loopback, and the real client
+        // comes from the proxy's headers (PASTE_TRUST_PROXY=1).
+        let app = app.layer(axum::extract::connect_info::MockConnectInfo(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        ));
+        axum::serve(listener, app.into_make_service())
+            .with_graceful_shutdown(shutdown_signal())
+            .await
+            .unwrap();
+    } else {
+        let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+        tracing::info!(
+            %addr,
+            env = %mode,
+            env_files = ?env_files,
+            logfire = logfire_enabled,
+            "listening on http://{addr}"
+        );
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .unwrap();
     }
-    let deploy_server = spawn_deploy_listener(stop_tx, stop_rx.clone()).await;
 
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    tracing::info!(
-        %addr,
-        env = %mode,
-        env_files = ?env_files,
-        logfire = logfire_enabled,
-        deploy_webhook = deploy_server.is_some(),
-        "listening on http://{addr}"
-    );
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .with_graceful_shutdown(stopped(stop_rx.clone()))
-    .await
-    .unwrap();
-    if let Some(server) = deploy_server {
-        // Lets the deploy listener finish sending its response.
-        let _ = server.await;
-    }
-
-    let restart = *stop_rx.borrow() == Stop::Restart;
-    tracing::info!(restart, "shutting down");
+    tracing::info!("shutting down");
     // Flush buffered spans and logs before exiting.
     if let Err(e) = logfire.shutdown() {
         eprintln!("logfire shutdown failed: {e}");
     }
-    if restart {
-        std::process::exit(deploy::RESTART_EXIT_CODE);
-    }
-}
-
-/// Resolves once anything asks the server to stop.
-async fn stopped(mut rx: watch::Receiver<Stop>) {
-    let _ = rx.wait_for(|s| *s != Stop::Running).await;
-}
-
-/// Starts the deploy webhook listener when `DEPLOY_WEBHOOK_SECRET` is set.
-async fn spawn_deploy_listener(
-    stop_tx: watch::Sender<Stop>,
-    stop_rx: watch::Receiver<Stop>,
-) -> Option<tokio::task::JoinHandle<()>> {
-    let secret = env::var("DEPLOY_WEBHOOK_SECRET").unwrap_or_default();
-    if secret.is_empty() {
-        tracing::info!("deploy webhook disabled (DEPLOY_WEBHOOK_SECRET not set)");
-        return None;
-    }
-    let addr = format!(
-        "{}:{}",
-        env::var("DEPLOY_WEBHOOK_HOST").unwrap_or_else(|_| "127.0.0.1".into()),
-        env::var("DEPLOY_WEBHOOK_PORT").unwrap_or_else(|_| "8787".into()),
-    );
-    let deployer = deploy::Deployer::new(
-        deploy::DeployConfig {
-            secret,
-            repo_dir: env::current_dir().expect("no working directory"),
-            build_command: env::var("DEPLOY_BUILD_COMMAND")
-                .ok()
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| "scripts/release-build.sh".into()),
-        },
-        stop_tx,
-    );
-    let listener = match tokio::net::TcpListener::bind(&addr).await {
-        Ok(l) => l,
-        Err(e) => {
-            tracing::error!(%addr, error = %e, "deploy webhook could not bind {addr}");
-            return None;
-        }
-    };
-    tracing::info!(%addr, "deploy webhook listening on {addr}/deploy");
-    Some(tokio::spawn(async move {
-        if let Err(e) = axum::serve(listener, deploy::router(deployer))
-            .with_graceful_shutdown(stopped(stop_rx))
-            .await
-        {
-            tracing::error!(error = %e, "deploy webhook server failed");
-        }
-    }))
 }
 
 fn app(state: Shared) -> Router {

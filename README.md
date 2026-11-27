@@ -70,27 +70,25 @@ CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs these on pushes
 
 ## Deploy
 
-Deployed on grizzly the standard way (the `grizzly-service` skill; same as musiclinks,
-basegame, jobevidz). Push to `main`: CI tests, then POSTs an HMAC-signed request to
-`https://paste.jobe.wtf/__deploy` (Actions secrets `DEPLOY_WEBHOOK_URL`,
-`DEPLOY_WEBHOOK_SECRET`; the same secret is in the server's `.env`). The hook
-([`src/deploy.rs`](src/deploy.rs), 127.0.0.1:8787) runs `git pull --ff-only` and
-[`scripts/release-build.sh`](scripts/release-build.sh) while the site keeps serving, then
-pasters exits with code 42 and [`start.sh`](start.sh) relaunches it. A failed pull or build
-is logged (journal, Logfire) and the old binary keeps running. Webhooks that arrive
-mid-build are coalesced into one more pull afterwards.
+Push to `main`: CI tests, then POSTs an HMAC-signed request to
+`https://deploy.jobe.wtf/pasters` (Actions secrets `DEPLOY_WEBHOOK_URL`,
+`DEPLOY_WEBHOOK_SECRET`). That is deployd, grizzly's deploy agent (jobeus/jobepanel,
+`servers/grizzly/deployd`): it checks the commit out into a new folder, runs
+[`scripts/release-build.sh`](scripts/release-build.sh) there while the site keeps serving
+the old binary, switches to it, restarts the app and checks that `/` answers. A failed build
+never touches the running version, and a release that doesn't answer is switched back
+automatically.
 
-| var | default | |
-|---|---|---|
-| `DEPLOY_WEBHOOK_SECRET` | unset | shared HMAC secret; the listener is off when empty |
-| `DEPLOY_WEBHOOK_HOST` | `127.0.0.1` | listener interface (Apache proxies to it) |
-| `DEPLOY_WEBHOOK_PORT` | `8787` | listener port |
-| `DEPLOY_BUILD_COMMAND` | `scripts/release-build.sh` | run after the pull, in the checkout |
+On grizzly everything is under `/srv/apps/pasters`: `current` is the live release,
+`shared/.env` holds the settings (`PASTE_TRUST_PROXY=1`, `LOGFIRE_API_KEY`), `shared/data`
+the pastes (linked in as `data/`), `cache/target` the cargo build cache. The unit is
+`app@pasters` (a template in jobepanel); it sets `APP_SOCKET=/run/apps/pasters/app.sock`,
+pasters listens there, and Apache proxies to it (vhost in jobepanel,
+`servers/grizzly/apache/sites-available/jobe.wtf.conf`).
 
-On grizzly: checkout `~jobe/webs/paste.jobe.wtf`, unit
-[`deploy/pasters.service`](deploy/pasters.service), settings and secrets in `.env` (600:
-`DEPLOY_WEBHOOK_SECRET`, `PASTE_TRUST_PROXY=1`, `LOGFIRE_API_KEY`), pastes in `data/`. The
-Apache vhost lives in jobepanel (`servers/grizzly/apache/sites-available/jobe.wtf.conf`).
-Manual deploy, as jobe in the checkout: `git pull && sudo systemctl restart pasters`.
-
-Logs on grizzly: `journalctl -u pasters -f` (deploys show up as `deploy` lines).
+```
+deploy status               # what is live, on grizzly
+deploy pasters              # deploy main by hand (or: deploy pasters <commit>)
+deploy rollback pasters     # back to the release before
+journalctl -u app@pasters -f      # app log;  journalctl -u deployd -f  for deploys
+```
