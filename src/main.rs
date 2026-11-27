@@ -229,9 +229,9 @@ async fn main() {
         );
         // No peer address on a unix socket: handlers see loopback, and the real client
         // comes from the proxy's headers (PASTE_TRUST_PROXY=1).
-        let app = app.layer(axum::extract::connect_info::MockConnectInfo(
-            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
-        ));
+        let app = app.layer(axum::Extension(axum::extract::ConnectInfo(
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+        )));
         axum::serve(listener, app.into_make_service())
             .with_graceful_shutdown(shutdown_signal())
             .await
