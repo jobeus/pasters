@@ -213,6 +213,13 @@ async fn main() {
         // A socket left behind by a process that was killed would make bind fail.
         let _ = std::fs::remove_file(&path);
         let listener = tokio::net::UnixListener::bind(&path).expect("failed to bind APP_SOCKET");
+        // Apache runs as another user and needs write access to connect. (Same exposure
+        // as a 127.0.0.1 port: any local user can reach it.)
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666))
+                .expect("failed to set APP_SOCKET permissions");
+        }
         tracing::info!(
             socket = %path,
             env = %mode,
